@@ -1,9 +1,14 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { GameRefs } from "../types/threejs";
+import { LoadingProgress } from "../components/threejs/LoadingManager";
 
 export const useGame = (
     canvasRef: React.RefObject<HTMLCanvasElement | null>
 ) => {
+    const [loadingProgress, setLoadingProgress] =
+        useState<LoadingProgress | null>(null);
+    const [isLoading, setIsLoading] = useState(true);
+
     const gameRefs = useRef<GameRefs>({
         gui: null,
         letters: [],
@@ -21,7 +26,8 @@ export const useGame = (
     });
 
     useEffect(() => {
-        if (!canvasRef.current || typeof window === "undefined") return;
+        if (!canvasRef.current || typeof window === "undefined" || !window)
+            return;
 
         // Dynamic imports to ensure client-side only execution
         const initGame = async () => {
@@ -39,6 +45,7 @@ export const useGame = (
                 handleCharacterMovement,
                 handleCharacterAnimations,
                 updateCamera,
+                createPhysicsBodyForMesh,
             } = await import("../utils/character");
             const { Lighting } = await import("../components/threejs/Lighting");
             const { GUI } = await import("../components/threejs/GUI");
@@ -47,6 +54,9 @@ export const useGame = (
             );
             const { TextManager } = await import(
                 "../components/threejs/TextManager"
+            );
+            const { LoadingManager } = await import(
+                "../components/threejs/LoadingManager"
             );
 
             // Scene setup
@@ -79,16 +89,16 @@ export const useGame = (
             const lighting = new Lighting(scene, GUI_PARAMS);
             const modelLoader = new ModelLoader();
             const textManager = new TextManager();
+            const loadingManager = new LoadingManager();
 
-            // Floor setup
-            // const { floorMesh, floorBody } = createFloor(
-            //   window.innerWidth / 100,
-            //   window.innerHeight / 100
-            // );
-            // gameRefs.current.planeMaterial =
-            //   floorMesh.material as THREE.MeshStandardMaterial;
-            // scene.add(floorMesh);
-            // world.addBody(floorBody);
+            // Set up loading callbacks
+            loadingManager.setProgressCallback((progress) => {
+                setLoadingProgress(progress);
+            });
+
+            loadingManager.setCompleteCallback(() => {
+                setIsLoading(false);
+            });
 
             // Create text material
             gameRefs.current.textMaterial = textManager.createTextMaterial(
@@ -104,28 +114,100 @@ export const useGame = (
             );
             gameRefs.current.gui = gui.getGUI();
 
-            // Load trees
-            modelLoader.loadTrees(scene);
+            // Load essential models first
+            const loadedModels = await loadingManager.loadEssentialModels(
+                scene,
+                world
+            );
 
-            // Load building and then character and text
-            modelLoader.loadBuilding(scene, world, () => {
-                // Create text after building loads
+            // Process loaded models
+            let character: any = null,
+                building: any = null,
+                font: any = null;
+
+            loadedModels.forEach((model: any) => {
+                if (model.type === "model") {
+                    if (model.name === "Character") {
+                        character = model.data;
+                    } else if (model.name === "Building") {
+                        building = model.data;
+                    }
+                } else if (model.type === "font") {
+                    font = model.data;
+                }
+            });
+
+            // Set up character
+            if (character) {
+                const characterScene = character.scene;
+                const animations = character.animations;
+                const mixer = new THREE.AnimationMixer(characterScene);
+                const animationsMap = new Map<string, any>();
+
+                if (animations && animations.length > 0) {
+                    animations.forEach((clip: any) => {
+                        const action = mixer.clipAction(clip);
+                        animationsMap.set(clip.name, action);
+                    });
+                    animationsMap.get("Idle")?.play();
+                }
+
+                characterScene.scale.set(0.3, 0.3, 0.3);
+                scene.add(characterScene);
+
+                let characterBody: any = null;
+                characterScene.traverse((child: any) => {
+                    if (child instanceof THREE.Mesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                        characterBody = createPhysicsBodyForMesh(
+                            child,
+                            characterScene.scale,
+                            1
+                        );
+                        world.addBody(characterBody);
+                    }
+                });
+
+                if (characterBody) {
+                    gameRefs.current.character = characterScene;
+                    gameRefs.current.characterBody = characterBody;
+                    gameRefs.current.mixer = mixer;
+                    gameRefs.current.animationsMap = animationsMap;
+                }
+            }
+
+            // Set up building
+            if (building) {
+                const buildingScene = building.scene;
+                buildingScene.position.set(0, 0, 0);
+                buildingScene.rotation.set(0, 0, 0);
+                buildingScene.scale.set(0.0009, 0.0009, 0.0009);
+                scene.add(buildingScene);
+
+                buildingScene.traverse((child: any) => {
+                    if (child instanceof THREE.Mesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                        const buildingBody = createPhysicsBodyForMesh(
+                            child,
+                            buildingScene.scale,
+                            0
+                        );
+                        world.addBody(buildingBody);
+                    }
+                });
+            }
+
+            // Create text with loaded font
+            if (font) {
                 textManager.createText(scene, world, (letters) => {
                     gameRefs.current.letters = letters;
                 });
+            }
 
-                // Load character after building loads
-                modelLoader.loadCharacter(
-                    scene,
-                    world,
-                    (character, body, mixer, animationsMap) => {
-                        gameRefs.current.character = character;
-                        gameRefs.current.characterBody = body;
-                        gameRefs.current.mixer = mixer;
-                        gameRefs.current.animationsMap = animationsMap;
-                    }
-                );
-            });
+            // Load trees in background (non-blocking)
+            loadingManager.loadTreesInBackground(scene);
 
             // Keyboard event handlers
             const handleKeyDown = (event: KeyboardEvent) => {
@@ -231,5 +313,5 @@ export const useGame = (
         };
     }, [canvasRef]);
 
-    return gameRefs;
+    return { gameRefs, loadingProgress, isLoading };
 };
